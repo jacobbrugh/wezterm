@@ -773,12 +773,22 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let local_pane = Mux::get()
+        let mux = Mux::get();
+
+        let local_pane = mux
             .get_pane(pane_id)
             .ok_or_else(|| anyhow!("pane_id {} is invalid", pane_id))?;
         let pane = local_pane
             .downcast_ref::<ClientPane>()
             .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", pane_id))?;
+
+        // Capture the source tab BEFORE the RPC so we can mirror the
+        // cleanup that Mux::move_pane_to_new_tab does for local domains
+        // (mux/src/lib.rs Mux::move_pane_to_new_tab). When the remote
+        // source tab becomes empty it is dropped server-side, and the
+        // resync that follows never rebuilds it locally — leaving a
+        // ghost Tab in mux.tabs that still references the moved pane.
+        let src_tab_id = mux.resolve_pane_id(pane_id).map(|(_, _, t)| t);
 
         let remote_window_id =
             window_id.and_then(|local_window| self.local_to_remote_window_id(local_window));
@@ -794,6 +804,22 @@ impl Domain for ClientDomain {
 
         self.resync().await?;
 
+        if let Some(src_tab_id) = src_tab_id {
+            if let Some(src_tab) = mux.get_tab(src_tab_id) {
+                if src_tab.contains_pane(pane_id) {
+                    // Non-killing removal: the pane is still live in the
+                    // mux (resync reused the same Arc for the new tab).
+                    src_tab.remove_pane(pane_id);
+                }
+                if src_tab.is_dead() {
+                    // Safe: tab now has zero panes, so remove_tab_internal's
+                    // pane-kill loop iterates nothing and no KillPane RPC
+                    // is sent for the moved pane.
+                    mux.remove_tab(src_tab_id);
+                }
+            }
+        }
+
         let local_tab_id = inner
             .remote_to_local_tab_id(result.tab_id)
             .ok_or_else(|| anyhow!("remote tab {} didn't resolve after resync", result.tab_id))?;
@@ -807,7 +833,7 @@ impl Domain for ClientDomain {
                 )
             })?;
 
-        let tab = Mux::get()
+        let tab = mux
             .get_tab(local_tab_id)
             .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
 
