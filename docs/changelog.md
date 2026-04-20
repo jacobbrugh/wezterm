@@ -72,6 +72,9 @@ As features stabilize some brief notes about them will accumulate here.
   @mgpinf! #6801
 
 #### New
+* `[fork]` [switch_to_non_empty_workspace_on_empty](config/lua/config/switch_to_non_empty_workspace_on_empty.md)
+  option to disable the auto-promotion of another workspace when the
+  active one empties. Default `true` preserves prior behavior.
 * [wezterm.serde](config/lua/wezterm.serde/index.md) module for serialization
   and deserialization of JSON, TOML and YAML. Thanks to @expnn! #4969
 * `wezterm ssh` now supports agent forwarding. Thanks to @Riatre! #5345

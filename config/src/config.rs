@@ -869,6 +869,15 @@ pub struct Config {
     #[dynamic(default)]
     pub default_workspace: Option<String>,
 
+    /// When the active workspace becomes empty, wezterm by default
+    /// picks the first non-empty workspace and promotes it into view.
+    /// Set this to false to leave the workspace empty instead — the
+    /// GUI window will close normally if nothing else is keeping it
+    /// open. Useful when using a hidden workspace (e.g. "parked") as
+    /// a stash for backgrounded panes.
+    #[dynamic(default = "default_true")]
+    pub switch_to_non_empty_workspace_on_empty: bool,
+
     #[dynamic(default)]
     pub xcursor_theme: Option<String>,
 

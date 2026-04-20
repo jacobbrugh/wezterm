@@ -352,11 +352,13 @@ impl GuiFrontEnd {
                 promise.ok(());
                 return promise.get_future().unwrap();
             }
-            for workspace in mux.iter_workspaces() {
-                if !mux.is_workspace_empty(&workspace) {
-                    mux.set_active_workspace_for_client(&self.client_id, &workspace);
-                    log::debug!("using {} instead, as it is not empty", workspace);
-                    break;
+            if config::configuration().switch_to_non_empty_workspace_on_empty {
+                for workspace in mux.iter_workspaces() {
+                    if !mux.is_workspace_empty(&workspace) {
+                        mux.set_active_workspace_for_client(&self.client_id, &workspace);
+                        log::debug!("using {} instead, as it is not empty", workspace);
+                        break;
+                    }
                 }
             }
         }
