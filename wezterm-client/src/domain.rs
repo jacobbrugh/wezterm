@@ -6,7 +6,7 @@ use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::connui::{ConnectionUI, ConnectionUIParams};
-use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
+use mux::domain::{Domain, DomainId, DomainState, SplitSource, alloc_domain_id};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitRequest, Tab, TabId};
 use mux::window::WindowId;
@@ -816,6 +816,15 @@ impl Domain for ClientDomain {
                     // pane-kill loop iterates nothing and no KillPane RPC
                     // is sent for the moved pane.
                     mux.remove_tab(src_tab_id);
+                    // remove_tab -> prune_dead_windows may drop the local
+                    // window that held src_tab. If it does, our
+                    // remote_to_local_window mapping for that window is now
+                    // a dangling reference; without a PaneRemoved PDU to
+                    // trigger expire_stale_mappings() the usual way, the
+                    // next process_pane_list walks the map and blows
+                    // `.expect("no such window!?")`. Sweep the mappings
+                    // here to keep the invariant honest.
+                    inner.expire_stale_mappings();
                 }
             }
         }
