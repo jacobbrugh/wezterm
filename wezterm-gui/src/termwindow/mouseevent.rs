@@ -125,6 +125,10 @@ impl super::TermWindow {
             WMEK::Release(ref press) => {
                 self.current_mouse_capture = None;
                 self.current_mouse_buttons.retain(|p| p != press);
+                if press == &MousePress::Left {
+                    // Any scheduled drag-select autoscroll tick is now stale.
+                    self.autoscroll_selection_mode.set(None);
+                }
                 if press == &MousePress::Left && self.window_drag_position.take().is_some() {
                     // Completed a window drag
                     return;
@@ -155,6 +159,11 @@ impl super::TermWindow {
                 self.last_mouse_click = Some(click);
                 self.current_mouse_buttons.retain(|p| p != press);
                 self.current_mouse_buttons.push(*press);
+                if press == &MousePress::Left {
+                    // A fresh Left press starts a new drag lifetime; drop any
+                    // tick scheduled by the previous drag.
+                    self.autoscroll_selection_mode.set(None);
+                }
             }
 
             WMEK::Move => {
