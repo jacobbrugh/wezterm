@@ -1,10 +1,20 @@
 use crate::selection::{Selection, SelectionCoordinate, SelectionMode, SelectionRange, SelectionX};
-use ::window::WindowOps;
+use crate::termwindow::TermWindowNotif;
+use ::window::{MousePress, WindowOps};
 use mux::pane::{Pane, PaneId};
+use smol::Timer;
 use std::cell::RefMut;
 use std::sync::Arc;
+use std::time::Duration;
 use termwiz::surface::Line;
 use wezterm_term::StableRowIndex;
+
+/// Cadence at which `tick_selection_autoscroll` re-drives the per-event scroll
+/// while a drag-select is parked past the viewport's top or bottom edge. ~25 Hz
+/// matches the feel of typical OS scrollbar autoscroll; fast enough to appear
+/// continuous, slow enough that a user snapping back inside the viewport gets
+/// at most one stale tick before the scheduling flag clears.
+const AUTOSCROLL_SELECTION_INTERVAL: Duration = Duration::from_millis(40);
 
 impl super::TermWindow {
     pub fn selection(&self, pane_id: PaneId) -> RefMut<'_, Selection> {
@@ -227,17 +237,80 @@ impl super::TermWindow {
 
         let dims = pane.get_dimensions();
 
-        // Scroll viewport when mouse mouves out of its vertical bounds
-        if position.row == 0 && position.y_pixel_offset < 0 {
+        // Scroll viewport when the mouse is past its vertical bounds. If we
+        // do scroll, we also have to resync the cached `mouse_terminal_coords`
+        // so that a subsequent tick (see `maybe_schedule_selection_autoscroll`)
+        // picks up the cell under the now-stationary cursor in the freshly
+        // scrolled viewport rather than the stable row the original motion
+        // event captured.
+        let scrolled = if position.row == 0 && position.y_pixel_offset < 0 {
             self.set_viewport(pane.pane_id(), Some(y.saturating_sub(1)), dims);
+            true
         } else if position.row >= dims.viewport_rows as i64 {
             let top = self
                 .get_viewport(pane.pane_id())
                 .unwrap_or(dims.physical_top);
             self.set_viewport(pane.pane_id(), Some(top + 1), dims);
+            true
+        } else {
+            false
+        };
+
+        if scrolled {
+            let new_top = self
+                .get_viewport(pane.pane_id())
+                .unwrap_or(dims.physical_top);
+            let new_y = new_top + position.row as StableRowIndex;
+            self.pane_state(pane.pane_id())
+                .mouse_terminal_coords
+                .replace((position, new_y));
+            self.maybe_schedule_selection_autoscroll(mode);
+        } else {
+            // Pointer is back inside the viewport; any in-flight tick finds
+            // `None` and no-ops, ending the loop.
+            self.autoscroll_selection_mode.set(None);
         }
 
         self.window.as_ref().unwrap().invalidate();
+    }
+
+    /// Schedule a one-shot timer that re-drives `extend_selection_at_mouse_cursor`
+    /// while the drag is parked past the viewport's edge. The tick self-cancels
+    /// on button release or pointer re-entry. Idempotent: if a tick is already
+    /// scheduled, this is a no-op.
+    fn maybe_schedule_selection_autoscroll(&self, mode: SelectionMode) {
+        if self.autoscroll_selection_mode.get().is_some() {
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.autoscroll_selection_mode.set(Some(mode));
+
+        promise::spawn::spawn(async move {
+            Timer::after(AUTOSCROLL_SELECTION_INTERVAL).await;
+            window.notify(TermWindowNotif::Apply(Box::new(|tw| {
+                tw.tick_selection_autoscroll();
+            })));
+        })
+        .detach();
+    }
+
+    pub fn tick_selection_autoscroll(&mut self) {
+        let Some(mode) = self.autoscroll_selection_mode.take() else {
+            return;
+        };
+        if !self.current_mouse_buttons.contains(&MousePress::Left) {
+            return;
+        }
+        let Some(pane) = self.get_active_pane_or_overlay() else {
+            return;
+        };
+        // Re-run selection extension against the cached (and freshly resynced)
+        // mouse coordinates. If we're still past edge, the scrolled branch
+        // reschedules; if the user moved back into the viewport, the non-scroll
+        // branch clears the flag and the loop ends.
+        self.extend_selection_at_mouse_cursor(mode, &pane);
     }
 
     pub fn select_text_at_mouse_cursor(&mut self, mode: SelectionMode, pane: &Arc<dyn Pane>) {

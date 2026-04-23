@@ -31,7 +31,7 @@ use ::window::*;
 use anyhow::{anyhow, ensure, Context};
 use config::keyassignment::{
     Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern, PromptInputLine,
-    QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
+    QuickSelectArguments, RotationDirection, SelectionMode, SpawnCommand, SplitSize,
 };
 use config::window::WindowLevel;
 use config::{
@@ -53,7 +53,7 @@ use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
 use smol::channel::Sender;
 use smol::Timer;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
 use std::ops::Add;
 use std::rc::Rc;
@@ -413,6 +413,15 @@ pub struct TermWindow {
     current_mouse_buttons: Vec<MousePress>,
     current_mouse_capture: Option<MouseCapture>,
 
+    /// When `Some(mode)`, a self-rescheduling tick is scheduled to drive
+    /// drag-select autoscroll while the mouse is held past the viewport's
+    /// top or bottom edge. Closes wezterm/wezterm#8's stationary-pointer
+    /// gap: the per-event scroll in `extend_selection_at_mouse_cursor` only
+    /// advances on incoming motion events, and no OS synthesizes motion
+    /// events from a stationary pointer, so without this the viewport
+    /// freezes the moment the user stops wiggling the mouse past the edge.
+    autoscroll_selection_mode: Cell<Option<SelectionMode>>,
+
     opengl_info: Option<String>,
 
     /// Keeps track of double and triple clicks
@@ -724,6 +733,7 @@ impl TermWindow {
             pane_state: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
+            autoscroll_selection_mode: Cell::new(None),
             last_mouse_click: None,
             current_highlight: None,
             quad_generation: 0,
