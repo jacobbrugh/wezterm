@@ -40,6 +40,7 @@ mod customglyph;
 mod download;
 mod frontend;
 mod glyphcache;
+mod handoff_otel;
 mod inputmap;
 mod overlay;
 mod quad;
@@ -503,25 +504,96 @@ impl Publish {
     pub fn resolve(mux: &Arc<Mux>, config: &ConfigHandle, always_new_process: bool) -> Self {
         if mux.default_domain().domain_name() != config.default_domain.as_deref().unwrap_or("local")
         {
+            let mux_default = mux.default_domain().domain_name().to_string();
+            let cfg_default = format!("{:?}", config.default_domain);
+            log::info!(
+                target: "wezterm::handoff",
+                "pid={} resolve -> NoConnectNoPublish \
+                 (mux default_domain={mux_default} != config.default_domain={cfg_default})",
+                std::process::id()
+            );
+            handoff_otel::event(
+                "publish.resolve",
+                vec![
+                    opentelemetry::KeyValue::new("variant", "NoConnectNoPublish"),
+                    opentelemetry::KeyValue::new("reason", "mux_vs_config_default_domain_mismatch"),
+                    opentelemetry::KeyValue::new("mux.default_domain", mux_default),
+                    opentelemetry::KeyValue::new("config.default_domain", cfg_default),
+                ],
+            );
             return Self::NoConnectNoPublish;
         }
 
         if always_new_process {
+            log::info!(
+                target: "wezterm::handoff",
+                "pid={} resolve -> NoConnectNoPublish (always_new_process=true)",
+                std::process::id()
+            );
+            handoff_otel::event(
+                "publish.resolve",
+                vec![
+                    opentelemetry::KeyValue::new("variant", "NoConnectNoPublish"),
+                    opentelemetry::KeyValue::new("reason", "always_new_process"),
+                ],
+            );
             return Self::NoConnectNoPublish;
         }
 
         if config::is_config_overridden() {
             // They're using a specific config file: assume that it is
             // different from the running gui
-            log::trace!("skip existing gui: config is different");
+            log::info!(
+                target: "wezterm::handoff",
+                "pid={} resolve -> NoConnectNoPublish (config is overridden)",
+                std::process::id()
+            );
+            handoff_otel::event(
+                "publish.resolve",
+                vec![
+                    opentelemetry::KeyValue::new("variant", "NoConnectNoPublish"),
+                    opentelemetry::KeyValue::new("reason", "config_overridden"),
+                ],
+            );
             return Self::NoConnectNoPublish;
         }
 
         match wezterm_client::discovery::resolve_gui_sock_path(
             &crate::termwindow::get_window_class(),
         ) {
-            Ok(path) => Self::TryPathOrPublish(path),
-            Err(_) => Self::NoConnectButPublish,
+            Ok(path) => {
+                log::info!(
+                    target: "wezterm::handoff",
+                    "pid={} resolve -> TryPathOrPublish({})",
+                    std::process::id(),
+                    path.display()
+                );
+                handoff_otel::event(
+                    "publish.resolve",
+                    vec![
+                        opentelemetry::KeyValue::new("variant", "TryPathOrPublish"),
+                        opentelemetry::KeyValue::new("gui_sock", path.display().to_string()),
+                    ],
+                );
+                Self::TryPathOrPublish(path)
+            }
+            Err(err) => {
+                let err_s = format!("{err:#}");
+                log::info!(
+                    target: "wezterm::handoff",
+                    "pid={} resolve -> NoConnectButPublish (resolve_gui_sock_path failed: {err_s})",
+                    std::process::id()
+                );
+                handoff_otel::event(
+                    "publish.resolve",
+                    vec![
+                        opentelemetry::KeyValue::new("variant", "NoConnectButPublish"),
+                        opentelemetry::KeyValue::new("reason", "resolve_gui_sock_path_failed"),
+                        opentelemetry::KeyValue::new("error", err_s),
+                    ],
+                );
+                Self::NoConnectButPublish
+            }
         }
     }
 
@@ -547,22 +619,64 @@ impl Publish {
                 ..Default::default()
             };
             let mut ui = mux::connui::ConnectionUI::new_headless();
+            log::info!(
+                target: "wezterm::handoff",
+                "pid={} try_spawn connecting to gui-sock {}",
+                std::process::id(),
+                gui_sock.display()
+            );
+            handoff_otel::event(
+                "try_spawn.connect_attempt",
+                vec![opentelemetry::KeyValue::new(
+                    "gui_sock",
+                    gui_sock.display().to_string(),
+                )],
+            );
             match wezterm_client::client::Client::new_unix_domain(None, &dom, false, &mut ui, true)
             {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
                     let command = cmd.clone();
+                    let my_pid = std::process::id();
                     let res = block_on(executor.run(async move {
                         let vers = client.verify_version_compat(&mut ui).await?;
 
-                        if vers.executable_path != std::env::current_exe().context("resolve executable path")? {
+                        let my_exe = std::env::current_exe().context("resolve executable path")?;
+                        if vers.executable_path != my_exe {
+                            let server_exe = format!("{:?}", vers.executable_path);
+                            let our_exe = format!("{:?}", my_exe);
+                            log::warn!(
+                                target: "wezterm::handoff",
+                                "pid={my_pid} executable mismatch: server={server_exe} vs ours={our_exe}"
+                            );
+                            handoff_otel::event(
+                                "try_spawn.version_mismatch",
+                                vec![
+                                    opentelemetry::KeyValue::new("kind", "executable_path"),
+                                    opentelemetry::KeyValue::new("server", server_exe),
+                                    opentelemetry::KeyValue::new("ours", our_exe),
+                                ],
+                            );
                             *self = Publish::NoConnectNoPublish;
                             anyhow::bail!(
                                 "Running GUI is a different executable from us, will start a new one");
                         }
-                        if vers.config_file_path
-                            != std::env::var_os("WEZTERM_CONFIG_FILE").map(Into::into)
-                        {
+                        let my_cfg = std::env::var_os("WEZTERM_CONFIG_FILE").map(Into::into);
+                        if vers.config_file_path != my_cfg {
+                            let server_cfg = format!("{:?}", vers.config_file_path);
+                            let our_cfg = format!("{:?}", my_cfg);
+                            log::warn!(
+                                target: "wezterm::handoff",
+                                "pid={my_pid} config mismatch: server={server_cfg} vs ours={our_cfg}"
+                            );
+                            handoff_otel::event(
+                                "try_spawn.version_mismatch",
+                                vec![
+                                    opentelemetry::KeyValue::new("kind", "config_file_path"),
+                                    opentelemetry::KeyValue::new("server", server_cfg),
+                                    opentelemetry::KeyValue::new("ours", our_cfg),
+                                ],
+                            );
                             *self = Publish::NoConnectNoPublish;
                             anyhow::bail!(
                                 "Running GUI has different config from us, will start a new one"
@@ -619,18 +733,34 @@ impl Publish {
                     match res {
                         Ok(res) => {
                             log::info!(
-                                "Spawned your command via the existing GUI instance. \
-                             Use wezterm start --always-new-process if you do not want this behavior. \
-                             Result={:?}",
-                                res
+                                target: "wezterm::handoff",
+                                "pid={my_pid} handoff ok: spawned via existing GUI \
+                                 (use wezterm start --always-new-process to opt out); result={res:?}"
+                            );
+                            handoff_otel::event(
+                                "try_spawn.handoff_ok",
+                                vec![opentelemetry::KeyValue::new(
+                                    "spawn_response",
+                                    format!("{res:?}"),
+                                )],
                             );
                             Ok(true)
                         }
                         Err(err) => {
-                            log::trace!(
-                                "while attempting to ask existing instance to spawn: {:#}",
-                                err
+                            let err_s = format!("{err:#}");
+                            log::warn!(
+                                target: "wezterm::handoff",
+                                "pid={my_pid} handoff failed (spawn_v2 error): {err_s} \
+                                 -- falling through to fresh GUI frontend"
                             );
+                            handoff_otel::event(
+                                "try_spawn.handoff_failed",
+                                vec![
+                                    opentelemetry::KeyValue::new("cause", "spawn_v2_error"),
+                                    opentelemetry::KeyValue::new("error", err_s.clone()),
+                                ],
+                            );
+                            handoff_otel::set_error(&err_s);
                             Ok(false)
                         }
                     }
@@ -638,11 +768,40 @@ impl Publish {
                 Err(err) => {
                     // Couldn't connect: it's probably a stale symlink.
                     // That's fine: we can continue with starting a fresh gui below.
-                    log::trace!("{:#}", err);
+                    let err_s = format!("{err:#}");
+                    log::warn!(
+                        target: "wezterm::handoff",
+                        "pid={} handoff failed (cannot connect to gui-sock {}): {err_s} \
+                         -- falling through to fresh GUI frontend",
+                        std::process::id(),
+                        gui_sock.display()
+                    );
+                    handoff_otel::event(
+                        "try_spawn.handoff_failed",
+                        vec![
+                            opentelemetry::KeyValue::new("cause", "connect_failed"),
+                            opentelemetry::KeyValue::new("gui_sock", gui_sock.display().to_string()),
+                            opentelemetry::KeyValue::new("error", err_s.clone()),
+                        ],
+                    );
+                    handoff_otel::set_error(&err_s);
                     Ok(false)
                 }
             }
         } else {
+            log::info!(
+                target: "wezterm::handoff",
+                "pid={} try_spawn skipped (self={:?})",
+                std::process::id(),
+                self
+            );
+            handoff_otel::event(
+                "try_spawn.skipped",
+                vec![opentelemetry::KeyValue::new(
+                    "publish_variant",
+                    format!("{:?}", self),
+                )],
+            );
             Ok(false)
         }
     }
@@ -756,24 +915,171 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     // First, let's see if we can ask an already running wezterm to do this.
     // We must do this before we start the gui frontend as the scheduler
     // requirements are different.
+    //
+    // Open a handoff span covering the resolve + try_spawn decision flow;
+    // Publish::resolve and Publish::try_spawn add events and attributes
+    // onto the current span as they walk their branches. The span ends
+    // when `_handoff_span` drops — either on early return after successful
+    // handoff, or at the end of this function when a persistent GUI
+    // starts up.
+    let _handoff_span = handoff_otel::HandoffSpan::start(vec![
+        opentelemetry::KeyValue::new("process.pid", std::process::id() as i64),
+        opentelemetry::KeyValue::new(
+            "process.argv",
+            format!("{:?}", std::env::args().collect::<Vec<_>>()),
+        ),
+        opentelemetry::KeyValue::new(
+            "opts.domain",
+            opts.domain.clone().unwrap_or_default(),
+        ),
+        opentelemetry::KeyValue::new(
+            "opts.workspace",
+            opts.workspace.clone().unwrap_or_default(),
+        ),
+        opentelemetry::KeyValue::new("opts.attach", opts.attach),
+        opentelemetry::KeyValue::new("opts.new_tab", opts.new_tab),
+        opentelemetry::KeyValue::new(
+            "opts.always_new_process",
+            opts.always_new_process,
+        ),
+    ]);
+
     let mut publish = Publish::resolve(
         &mux,
         &config,
         opts.always_new_process || opts.position.is_some(),
     );
-    log::trace!("{:?}", publish);
+    log::info!(
+        target: "wezterm::handoff",
+        "pid={} run_terminal_gui argv={:?} opts.domain={:?} opts.workspace={:?} \
+         opts.attach={} opts.new_tab={} opts.always_new_process={} -> Publish={:?}",
+        std::process::id(),
+        std::env::args().collect::<Vec<_>>(),
+        opts.domain,
+        opts.workspace,
+        opts.attach,
+        opts.new_tab,
+        opts.always_new_process,
+        publish
+    );
+    let spawn_tab_domain = match &opts.domain {
+        Some(name) => SpawnTabDomain::DomainName(name.to_string()),
+        None => SpawnTabDomain::DefaultDomain,
+    };
     if publish.try_spawn(
         cmd.clone(),
         &config,
         opts.workspace.as_deref(),
-        match &opts.domain {
-            Some(name) => SpawnTabDomain::DomainName(name.to_string()),
-            None => SpawnTabDomain::DefaultDomain,
-        },
+        spawn_tab_domain.clone(),
         opts.new_tab,
     )? {
+        log::info!(
+            target: "wezterm::handoff",
+            "pid={} exiting cleanly after successful handoff",
+            std::process::id()
+        );
+        handoff_otel::set_attr(opentelemetry::KeyValue::new(
+            "handoff.outcome",
+            "handoff_ok_exit",
+        ));
         return Ok(());
     }
+
+    // First-try handoff failed. Before promoting this ephemeral caller into
+    // a persistent GUI — the step that has caused a seven-generation GUI
+    // accumulation cascade on this user's Mac, captured in
+    // ~/.local/share/wezterm/wezterm-gui-log-{95686,64893,30976,5573,
+    // 36927,82408,83838}.txt — sweep the runtime dir for any live
+    // wezterm-gui peer. `discover_gui_socks()` prunes dead socks inline
+    // (deletes their files after a 1-second grace) and returns survivors
+    // oldest-first. For each survivor, retry the SpawnV2 RPC; if any
+    // accepts, repoint the default symlink at that survivor and exit
+    // clean. Only if the sweep is empty (genuinely no live wezterm-gui on
+    // this host) or every survivor also fails do we fall through to
+    // `crate::frontend::try_new()` — the legitimate cold-start path that
+    // preserves the "hyper+T always gives you a window" UX contract.
+    let survivors = wezterm_client::discovery::discover_gui_socks();
+    handoff_otel::event(
+        "fresh_gui_fallthrough.sweep",
+        vec![opentelemetry::KeyValue::new(
+            "survivors",
+            survivors.len() as i64,
+        )],
+    );
+    log::info!(
+        target: "wezterm::handoff",
+        "pid={} first-try handoff failed; sweeping {} live wezterm-gui socket(s) before cold-start",
+        std::process::id(),
+        survivors.len()
+    );
+    let class = crate::termwindow::get_window_class();
+    for sock in survivors {
+        log::info!(
+            target: "wezterm::handoff",
+            "pid={} retry handoff against survivor sock {}",
+            std::process::id(),
+            sock.display()
+        );
+        let mut retry = Publish::TryPathOrPublish(sock.clone());
+        match retry.try_spawn(
+            cmd.clone(),
+            &config,
+            opts.workspace.as_deref(),
+            spawn_tab_domain.clone(),
+            opts.new_tab,
+        ) {
+            Ok(true) => {
+                match wezterm_client::discovery::publish_gui_sock_path(&sock, &class) {
+                    Ok(holder) => {
+                        // Leak the returned NameHolder so its Drop doesn't
+                        // remove the symlink when this transient caller
+                        // exits. The survivor's own NameHolder (alive in the
+                        // long-running GUI) stays the authoritative publisher
+                        // and will clean up correctly when the survivor
+                        // itself exits.
+                        std::mem::forget(holder);
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            target: "wezterm::handoff",
+                            "pid={} repoint of default symlink to {} failed: {err:#} \
+                             (handoff already succeeded; next hotkey press may sweep again)",
+                            std::process::id(),
+                            sock.display()
+                        );
+                    }
+                }
+                handoff_otel::event(
+                    "fresh_gui_fallthrough.survivor_handoff",
+                    vec![opentelemetry::KeyValue::new(
+                        "survivor_sock",
+                        sock.display().to_string(),
+                    )],
+                );
+                handoff_otel::set_attr(opentelemetry::KeyValue::new(
+                    "handoff.outcome",
+                    "survivor_handoff_ok_exit",
+                ));
+                return Ok(());
+            }
+            Ok(false) | Err(_) => continue,
+        }
+    }
+
+    log::warn!(
+        target: "wezterm::handoff",
+        "pid={} creating persistent GUI frontend (handoff did not succeed; should_publish={})",
+        std::process::id(),
+        publish.should_publish()
+    );
+    handoff_otel::set_attr(opentelemetry::KeyValue::new(
+        "handoff.outcome",
+        "fresh_gui_frontend",
+    ));
+    handoff_otel::set_attr(opentelemetry::KeyValue::new(
+        "handoff.should_publish",
+        publish.should_publish(),
+    ));
 
     let gui = crate::frontend::try_new()?;
     let activity = Activity::new();
@@ -833,9 +1139,23 @@ fn main() {
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);
     notify_on_panic();
+    // Initialize OTel tracing for the handoff path before `run()` so that
+    // Publish::resolve / try_spawn events are captured from the first call.
+    // No-op if OTEL_EXPORTER_OTLP_ENDPOINT is unreachable or
+    // WEZTERM_OTEL_DISABLE is set.
+    let otel_on = handoff_otel::init();
+    if otel_on {
+        log::info!(
+            target: "wezterm::handoff",
+            "pid={} OTel tracer initialized",
+            std::process::id()
+        );
+    }
     if let Err(e) = run() {
+        handoff_otel::shutdown();
         terminate_with_error(e);
     }
+    handoff_otel::shutdown();
     Mux::shutdown();
     frontend::shutdown();
 }

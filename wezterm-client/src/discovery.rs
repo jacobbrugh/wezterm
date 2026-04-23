@@ -259,10 +259,31 @@ mod unix {
     impl Drop for NameHolder {
         fn drop(&mut self) {
             // If it still points to us, remove the symlink
-            if let Ok(target) = std::fs::read_link(&self.name) {
-                if target == self.published {
-                    log::trace!("removing {}", self.name.display());
+            match std::fs::read_link(&self.name) {
+                Ok(target) if target == self.published => {
+                    log::info!(
+                        "[fork-handoff] NameHolder::drop pid={} removing default symlink {} -> {}",
+                        std::process::id(),
+                        self.name.display(),
+                        target.display()
+                    );
                     std::fs::remove_file(&self.name).ok();
+                }
+                Ok(target) => {
+                    log::info!(
+                        "[fork-handoff] NameHolder::drop pid={} leaving default symlink alone \
+                         (points to {} not our {})",
+                        std::process::id(),
+                        target.display(),
+                        self.published.display()
+                    );
+                }
+                Err(err) => {
+                    log::info!(
+                        "[fork-handoff] NameHolder::drop pid={} default symlink already gone: {:#}",
+                        std::process::id(),
+                        err
+                    );
                 }
             }
         }
@@ -301,9 +322,17 @@ mod unix {
 
         pub fn new(path: &Path, class_name: &str) -> anyhow::Result<Self> {
             let name = Self::compute_path(class_name);
+            let prior = std::fs::read_link(&name).ok();
             std::fs::remove_file(&name).ok();
             std::os::unix::fs::symlink(path, &name)
                 .with_context(|| format!("pointing {} -> {}", name.display(), path.display()))?;
+            log::info!(
+                "[fork-handoff] NameHolder::new pid={} published default symlink {} -> {} (prior target={:?})",
+                std::process::id(),
+                name.display(),
+                path.display(),
+                prior
+            );
             Ok(Self {
                 published: path.to_path_buf(),
                 name,
@@ -312,7 +341,23 @@ mod unix {
 
         pub fn resolve(class_name: &str) -> anyhow::Result<PathBuf> {
             let name = Self::compute_path(class_name);
-            std::fs::read_link(&name).with_context(|| format!("reading symlink {}", name.display()))
+            let result = std::fs::read_link(&name)
+                .with_context(|| format!("reading symlink {}", name.display()));
+            match &result {
+                Ok(target) => log::info!(
+                    "[fork-handoff] NameHolder::resolve pid={} read {} -> {}",
+                    std::process::id(),
+                    name.display(),
+                    target.display()
+                ),
+                Err(err) => log::info!(
+                    "[fork-handoff] NameHolder::resolve pid={} failed to read {}: {:#}",
+                    std::process::id(),
+                    name.display(),
+                    err
+                ),
+            }
+            result
         }
     }
 }
