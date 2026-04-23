@@ -66,6 +66,9 @@ mlua = {workspace=true, features=["send", "serialize"]}
 mux-lua.workspace = true
 mux.workspace = true
 nucleo-matcher.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 ordered-float.workspace = true
 parking_lot.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
