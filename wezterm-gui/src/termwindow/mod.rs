@@ -422,6 +422,12 @@ pub struct TermWindow {
     /// freezes the moment the user stops wiggling the mouse past the edge.
     autoscroll_selection_mode: Cell<Option<SelectionMode>>,
 
+    /// Wall-clock instant when the current past-edge autoscroll bout began.
+    /// Used with `selection_autoscroll_speed_ramp` to ramp scroll speed up
+    /// the longer the pointer stays parked past the edge. Cleared when the
+    /// pointer re-enters the viewport or the left button is pressed/released.
+    autoscroll_selection_started: Cell<Option<Instant>>,
+
     opengl_info: Option<String>,
 
     /// Keeps track of double and triple clicks
@@ -734,6 +740,7 @@ impl TermWindow {
             current_mouse_buttons: vec![],
             current_mouse_capture: None,
             autoscroll_selection_mode: Cell::new(None),
+            autoscroll_selection_started: Cell::new(None),
             last_mouse_click: None,
             current_highlight: None,
             quad_generation: 0,

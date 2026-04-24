@@ -777,6 +777,16 @@ pub struct Config {
     #[dynamic(default = "default_alternate_buffer_wheel_scroll_speed")]
     pub alternate_buffer_wheel_scroll_speed: u8,
 
+    /// Velocity ramp for drag-select autoscroll past the viewport's top or
+    /// bottom edge. Each entry is `{ after_secs, rows_per_tick }`; when the
+    /// autoscroll tick fires, the step with the largest `after_secs` that is
+    /// still <= the elapsed time since the current past-edge bout started
+    /// wins. Entries don't have to be sorted; duplicates and zero-row steps
+    /// are fine (zero rows effectively pauses autoscroll). Set to an empty
+    /// list to disable acceleration entirely (always 1 row per tick).
+    #[dynamic(default = "default_selection_autoscroll_speed_ramp")]
+    pub selection_autoscroll_speed_ramp: Vec<SelectionAutoscrollSpeedStep>,
+
     #[dynamic(default = "default_status_update_interval")]
     pub status_update_interval: u64,
 
@@ -1860,6 +1870,32 @@ fn default_status_update_interval() -> u64 {
 
 fn default_alternate_buffer_wheel_scroll_speed() -> u8 {
     3
+}
+
+/// One step of the drag-select autoscroll speed ramp. After the cursor has
+/// been parked past the viewport's top or bottom edge for `after_secs`, each
+/// 40ms tick scrolls the viewport by `rows_per_tick` rows instead of one.
+#[derive(Debug, Clone, Copy, FromDynamic, ToDynamic)]
+pub struct SelectionAutoscrollSpeedStep {
+    pub after_secs: f32,
+    pub rows_per_tick: u8,
+}
+
+fn default_selection_autoscroll_speed_ramp() -> Vec<SelectionAutoscrollSpeedStep> {
+    vec![
+        SelectionAutoscrollSpeedStep {
+            after_secs: 0.0,
+            rows_per_tick: 1,
+        },
+        SelectionAutoscrollSpeedStep {
+            after_secs: 1.0,
+            rows_per_tick: 3,
+        },
+        SelectionAutoscrollSpeedStep {
+            after_secs: 3.0,
+            rows_per_tick: 6,
+        },
+    ]
 }
 
 fn default_num_alphabet() -> String {

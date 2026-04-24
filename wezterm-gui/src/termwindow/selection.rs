@@ -5,7 +5,7 @@ use mux::pane::{Pane, PaneId};
 use smol::Timer;
 use std::cell::RefMut;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use termwiz::surface::Line;
 use wezterm_term::StableRowIndex;
 
@@ -237,20 +237,23 @@ impl super::TermWindow {
 
         let dims = pane.get_dimensions();
 
-        // Scroll viewport when the mouse is past its vertical bounds. If we
-        // do scroll, we also have to resync the cached `mouse_terminal_coords`
-        // so that a subsequent tick (see `maybe_schedule_selection_autoscroll`)
-        // picks up the cell under the now-stationary cursor in the freshly
-        // scrolled viewport rather than the stable row the original motion
-        // event captured.
+        // Scroll viewport when the mouse is past its vertical bounds. The
+        // per-tick scroll distance ramps up the longer the pointer has been
+        // parked past the edge (see `selection_autoscroll_speed_ramp` in
+        // the config). If we do scroll, we also have to resync the cached
+        // `mouse_terminal_coords` so the next tick extends selection to
+        // the cell under the now-stationary cursor in the freshly scrolled
+        // viewport rather than the stable row the original motion event
+        // captured.
+        let scroll_rows = self.selection_autoscroll_rows_per_tick() as StableRowIndex;
         let scrolled = if position.row == 0 && position.y_pixel_offset < 0 {
-            self.set_viewport(pane.pane_id(), Some(y.saturating_sub(1)), dims);
+            self.set_viewport(pane.pane_id(), Some(y.saturating_sub(scroll_rows)), dims);
             true
         } else if position.row >= dims.viewport_rows as i64 {
             let top = self
                 .get_viewport(pane.pane_id())
                 .unwrap_or(dims.physical_top);
-            self.set_viewport(pane.pane_id(), Some(top + 1), dims);
+            self.set_viewport(pane.pane_id(), Some(top + scroll_rows), dims);
             true
         } else {
             false
@@ -267,8 +270,11 @@ impl super::TermWindow {
             self.maybe_schedule_selection_autoscroll(mode);
         } else {
             // Pointer is back inside the viewport; any in-flight tick finds
-            // `None` and no-ops, ending the loop.
+            // `None` and no-ops, ending the loop. Also drop the speed-ramp
+            // clock so the next time the pointer leaves the edge the ramp
+            // starts at 0s again.
             self.autoscroll_selection_mode.set(None);
+            self.autoscroll_selection_started.set(None);
         }
 
         self.window.as_ref().unwrap().invalidate();
@@ -278,7 +284,14 @@ impl super::TermWindow {
     /// while the drag is parked past the viewport's edge. The tick self-cancels
     /// on button release or pointer re-entry. Idempotent: if a tick is already
     /// scheduled, this is a no-op.
+    ///
+    /// Also starts the speed-ramp clock on the first past-edge tick of the
+    /// current bout; subsequent invocations preserve it so the ramp measures
+    /// continuous past-edge time (not time since the most recent tick).
     fn maybe_schedule_selection_autoscroll(&self, mode: SelectionMode) {
+        if self.autoscroll_selection_started.get().is_none() {
+            self.autoscroll_selection_started.set(Some(Instant::now()));
+        }
         if self.autoscroll_selection_mode.get().is_some() {
             return;
         }
@@ -294,6 +307,27 @@ impl super::TermWindow {
             })));
         })
         .detach();
+    }
+
+    /// Look up the rows-per-tick for the current autoscroll bout by walking
+    /// the `selection_autoscroll_speed_ramp` config and picking the largest
+    /// `rows_per_tick` among entries whose `after_secs` is less than or
+    /// equal to the elapsed time since the bout began. Tolerates an
+    /// unsorted, empty, or partially-overlapping ramp; falls back to 1 row
+    /// per tick if nothing matches.
+    fn selection_autoscroll_rows_per_tick(&self) -> usize {
+        let elapsed = self
+            .autoscroll_selection_started
+            .get()
+            .map(|started| started.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
+        self.config
+            .selection_autoscroll_speed_ramp
+            .iter()
+            .filter(|step| step.after_secs <= elapsed)
+            .map(|step| step.rows_per_tick as usize)
+            .max()
+            .unwrap_or(1)
     }
 
     pub fn tick_selection_autoscroll(&mut self) {
